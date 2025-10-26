@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "🚀 检测系统类型..."
+if [[ -f /etc/os-release ]]; then
+  . /etc/os-release
+  OS="${ID:-}"
+  LIKE="${ID_LIKE:-}"
+else
+  echo "❌ 无法识别系统类型，请手动安装 Docker。"
+  exit 1
+fi
+
+# 允许在 root 环境下没有 sudo 的情况
+if command -v sudo >/dev/null 2>&1; then
+  SUDO="sudo"
+else
+  SUDO=""
+fi
+
+echo "🧩 系统检测结果: OS=${OS:-unknown}, ID_LIKE=${LIKE:-none}"
+
+# === 公网 IP 地理位置探测（是否在中国） =========================================
+detect_country() {
+  # 依次尝试多个服务，任何一个成功返回都用它；都失败则返回空
+  for url in \
+    "https://ipinfo.io/country" \
+    "https://ifconfig.co/country" \
+    "https://ipapi.co/country" \
+    "https://ip.sb/country"
+  do
+    code="$(curl -fsSL --max-time 2 "$url" 2>/dev/null || true)"
+    # 取首行，去空白
+    code="$(printf "%s" "$code" | head -n1 | tr -d ' \r\n' )"
+    if [[ -n "$code" ]]; then
+      echo "$code"
+      return 0
+    fi
+  done
+
+  # 兜底（中文站点，可能返回“来自：中国 …”）
+  txt="$(curl -fsSL --max-time 2 "https://cip.cc" 2>/dev/null || true)"
+  if echo "$txt" | grep -q "中国"; then
+    echo "CN"
+    return 0
+  fi
+
+  echo ""
+  return 1
+}
+
+COUNTRY="$(detect_country || true)"
+IN_CN=0
+if [[ "${COUNTRY^^}" == "CN" ]]; then
+  IN_CN=1
+  echo "🌏 地理位置判断：检测到中国境内（country=$COUNTRY），将使用清华 TUNA 的 Docker CE 源。"
+else
+  echo "🌏 地理位置判断：未检测到中国境内（country=${COUNTRY:-unknown}），将使用 Docker 官方源。"
+fi
+
+# === 归类家族：debian / rhel / fedora ==========================================
+FAMILY=""
+case "$OS $LIKE" in
+  *ubuntu*|*debian*|*Debian*|*Ubuntu*)
+    FAMILY="debian"
+    ;;
+  *fedora*)
+    FAMILY="fedora"
+    ;;
+  *rhel*|*centos*|*rocky*|*almalinux*|*ol*)
+    FAMILY="rhel"
+    ;;
+  *)
+    if [[ "${LIKE,,}" == *debian* ]]; then FAMILY="debian"; fi
+    if [[ -z "$FAMILY" && "${LIKE,,}" == *rhel* ]]; then FAMILY="rhel"; fi
+    if [[ -z "$FAMILY" && "${LIKE,,}" == *fedora* ]]; then FAMILY="fedora"; fi
+    ;;
+esac
+
+if [[ -z "$FAMILY" ]]; then
+  echo "❌ 暂不支持的系统: OS=$OS, ID_LIKE=$LIKE，请手动安装 Docker。"
+  exit 1
+fi
+
+# === 先尽量移除旧版本（容错） ====================================================
+$SUDO sh -c 'apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true' || true
+$SUDO sh -c 'yum remove -y docker docker-client docker-client-latest docker-common docker-latest docker-latest-logrotate docker-logrotate docker-engine 2>/dev/null || true' || true
+$SUDO sh -c 'dnf remove -y docker docker-client docker-client-latest docker-common docker-latest docker-latest-logrotate docker-logrotate docker-engine 2>/dev/null || true' || true
+
+# === 安装 Docker（根据家族 & 是否在中国切源） ====================================
+case "$FAMILY" in
+  debian)
+    echo "📦 为 Debian/Ubuntu 系安装 Docker..."
+    $SUDO apt-get update -y
+    $SUDO apt-get install -y ca-certificates curl gnupg lsb-release
+    $SUDO install -m 0755 -d /etc/apt/keyrings
+
+    # 某些衍生版用 debian 源更稳妥（比如 ID 不是 ubuntu/debian）
+    APT_BASE="$OS"
+    if [[ "$OS" != "ubuntu" && "$OS" != "debian" ]]; then
+      APT_BASE="debian"
+    fi
+
+    if [[ "$IN_CN" -eq 1 ]]; then
+      # 清华 TUNA：公钥与仓库都走镜像站（官方帮助推荐方式）
+      # 参考：https://mirrors.tuna.tsinghua.edu.cn/help/docker-ce/
+      curl -fsSL "https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/${APT_BASE}/gpg" \
+        | $SUDO gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+      $SUDO chmod a+r /etc/apt/keyrings/docker.gpg
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/${APT_BASE} $(lsb_release -cs) stable" \
+        | $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
+    else
+      # 官方源
+      curl -fsSL "https://download.docker.com/linux/${APT_BASE}/gpg" \
+        | $SUDO gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+      $SUDO chmod a+r /etc/apt/keyrings/docker.gpg
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${APT_BASE} $(lsb_release -cs) stable" \
+        | $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
+    fi
+
+    $SUDO apt-get update -y
+    $SUDO apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    ;;
+  rhel)
+    echo "📦 为 RHEL/CentOS/Alma/Rocky 系安装 Docker..."
+    # 选择包管理器
+    if command -v dnf >/dev/null 2>&1; then
+      $SUDO dnf -y install dnf-plugins-core
+      BASE_OS_REPO="centos"
+      [[ "$OS" == "rhel" ]] && BASE_OS_REPO="rhel"
+      $SUDO dnf config-manager --add-repo "https://download.docker.com/linux/${BASE_OS_REPO}/docker-ce.repo"
+
+      if [[ "$IN_CN" -eq 1 ]]; then
+        # 清华 TUNA：按官方建议，替换 repo 文件中的域名为镜像站
+        # 参考：https://mirrors.tuna.tsinghua.edu.cn/help/docker-ce/
+        $SUDO sed -i 's+https://download.docker.com+https://mirrors.tuna.tsinghua.edu.cn/docker-ce+g' /etc/yum.repos.d/docker-ce.repo
+      fi
+
+      $SUDO dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    else
+      $SUDO yum install -y yum-utils
+      BASE_OS_REPO="centos"
+      [[ "$OS" == "rhel" ]] && BASE_OS_REPO="rhel"
+      $SUDO yum-config-manager --add-repo "https://download.docker.com/linux/${BASE_OS_REPO}/docker-ce.repo"
+
+      if [[ "$IN_CN" -eq 1 ]]; then
+        # 清华 TUNA 替换
+        $SUDO sed -i 's+https://download.docker.com+https://mirrors.tuna.tsinghua.edu.cn/docker-ce+g' /etc/yum.repos.d/docker-ce.repo
+      fi
+
+      $SUDO yum install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    fi
+    ;;
+  fedora)
+    echo "📦 为 Fedora 安装 Docker..."
+    $SUDO dnf -y install dnf-plugins-core
+    $SUDO dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo
+
+    if [[ "$IN_CN" -eq 1 ]]; then
+      # 清华 TUNA：替换到镜像站
+      # 参考：https://mirrors.tuna.tsinghua.edu.cn/help/docker-ce/
+      $SUDO sed -i 's+https://download.docker.com+https://mirrors.tuna.tsinghua.edu.cn/docker-ce+g' /etc/yum.repos.d/docker-ce.repo
+    fi
+
+    $SUDO dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    ;;
+esac
+
+# === 启动 & 自启（非 systemd 环境忽略） ==========================================
+if command -v systemctl >/dev/null 2>&1; then
+  $SUDO systemctl enable docker || true
+  $SUDO systemctl start docker || true
+else
+  echo "ℹ️ 当前环境没有 systemd（可能是容器/WSL）。已跳过 systemctl 操作。"
+fi
+
+echo "✅ Docker 已安装完成！版本信息如下："
+docker --version || (echo "⚠️ 'docker' 可能未在 PATH 或需要重新登录 shell。"; true)
+echo "✅ Docker Compose 插件版本信息如下："
+docker compose version || (echo "⚠️ 'docker compose' 可能未在 PATH 或需要重新登录 shell。"; true)
+
+# === 可选：将当前用户加入 docker 组（无 sudo 用 docker） =========================
+if getent group docker >/dev/null 2>&1; then
+  if [[ "${EUID:-$(id -u)}" -ne 0 && -n "${USER:-}" ]]; then
+    echo "👤 可选：将用户 ${USER} 加入 docker 组以无 sudo 使用 docker"
+    $SUDO usermod -aG docker "$USER" || true
+    echo "ℹ️ 加入用户组后需重新登录终端或执行 'newgrp docker' 生效。"
+  fi
+fi
+
+# === 可选：简单验证（不影响主流程） =============================================
+if command -v docker >/dev/null 2>&1; then
+  echo "🧪 进行 hello-world 测试（可跳过失败，不中断）..."
+  $SUDO docker run --rm hello-world || true
+fi
+
+echo "🎉 全部完成！"
