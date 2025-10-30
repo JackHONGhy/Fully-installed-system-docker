@@ -22,7 +22,6 @@ echo "🧩 系统检测结果: OS=${OS:-unknown}, ID_LIKE=${LIKE:-none}"
 
 # === 公网 IP 地理位置探测（是否在中国） =========================================
 detect_country() {
-  # 依次尝试多个服务，任何一个成功返回都用它；都失败则返回空
   for url in \
     "https://ipinfo.io/country" \
     "https://ifconfig.co/country" \
@@ -30,7 +29,6 @@ detect_country() {
     "https://ip.sb/country"
   do
     code="$(curl -fsSL --max-time 2 "$url" 2>/dev/null || true)"
-    # 取首行，去空白
     code="$(printf "%s" "$code" | head -n1 | tr -d ' \r\n' )"
     if [[ -n "$code" ]]; then
       echo "$code"
@@ -38,7 +36,6 @@ detect_country() {
     fi
   done
 
-  # 兜底（中文站点，可能返回“来自：中国 …”）
   txt="$(curl -fsSL --max-time 2 "https://cip.cc" 2>/dev/null || true)"
   if echo "$txt" | grep -q "中国"; then
     echo "CN"
@@ -95,22 +92,18 @@ case "$FAMILY" in
     $SUDO apt-get install -y ca-certificates curl gnupg lsb-release
     $SUDO install -m 0755 -d /etc/apt/keyrings
 
-    # 某些衍生版用 debian 源更稳妥（比如 ID 不是 ubuntu/debian）
     APT_BASE="$OS"
     if [[ "$OS" != "ubuntu" && "$OS" != "debian" ]]; then
       APT_BASE="debian"
     fi
 
     if [[ "$IN_CN" -eq 1 ]]; then
-      # 清华 TUNA：公钥与仓库都走镜像站（官方帮助推荐方式）
-      # 参考：https://mirrors.tuna.tsinghua.edu.cn/help/docker-ce/
       curl -fsSL "https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/${APT_BASE}/gpg" \
         | $SUDO gpg --dearmor -o /etc/apt/keyrings/docker.gpg
       $SUDO chmod a+r /etc/apt/keyrings/docker.gpg
       echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/${APT_BASE} $(lsb_release -cs) stable" \
         | $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
     else
-      # 官方源
       curl -fsSL "https://download.docker.com/linux/${APT_BASE}/gpg" \
         | $SUDO gpg --dearmor -o /etc/apt/keyrings/docker.gpg
       $SUDO chmod a+r /etc/apt/keyrings/docker.gpg
@@ -123,7 +116,6 @@ case "$FAMILY" in
     ;;
   rhel)
     echo "📦 为 RHEL/CentOS/Alma/Rocky 系安装 Docker..."
-    # 选择包管理器
     if command -v dnf >/dev/null 2>&1; then
       $SUDO dnf -y install dnf-plugins-core
       BASE_OS_REPO="centos"
@@ -131,8 +123,6 @@ case "$FAMILY" in
       $SUDO dnf config-manager --add-repo "https://download.docker.com/linux/${BASE_OS_REPO}/docker-ce.repo"
 
       if [[ "$IN_CN" -eq 1 ]]; then
-        # 清华 TUNA：按官方建议，替换 repo 文件中的域名为镜像站
-        # 参考：https://mirrors.tuna.tsinghua.edu.cn/help/docker-ce/
         $SUDO sed -i 's+https://download.docker.com+https://mirrors.tuna.tsinghua.edu.cn/docker-ce+g' /etc/yum.repos.d/docker-ce.repo
       fi
 
@@ -144,7 +134,6 @@ case "$FAMILY" in
       $SUDO yum-config-manager --add-repo "https://download.docker.com/linux/${BASE_OS_REPO}/docker-ce.repo"
 
       if [[ "$IN_CN" -eq 1 ]]; then
-        # 清华 TUNA 替换
         $SUDO sed -i 's+https://download.docker.com+https://mirrors.tuna.tsinghua.edu.cn/docker-ce+g' /etc/yum.repos.d/docker-ce.repo
       fi
 
@@ -157,8 +146,6 @@ case "$FAMILY" in
     $SUDO dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo
 
     if [[ "$IN_CN" -eq 1 ]]; then
-      # 清华 TUNA：替换到镜像站
-      # 参考：https://mirrors.tuna.tsinghua.edu.cn/help/docker-ce/
       $SUDO sed -i 's+https://download.docker.com+https://mirrors.tuna.tsinghua.edu.cn/docker-ce+g' /etc/yum.repos.d/docker-ce.repo
     fi
 
@@ -166,7 +153,7 @@ case "$FAMILY" in
     ;;
 esac
 
-# === 启动 & 自启（非 systemd 环境忽略） ==========================================
+# === 启动 & 自启 ===============================================================
 if command -v systemctl >/dev/null 2>&1; then
   $SUDO systemctl enable docker || true
   $SUDO systemctl start docker || true
@@ -179,7 +166,24 @@ docker --version || (echo "⚠️ 'docker' 可能未在 PATH 或需要重新登�
 echo "✅ Docker Compose 插件版本信息如下："
 docker compose version || (echo "⚠️ 'docker compose' 可能未在 PATH 或需要重新登录 shell。"; true)
 
-# === 可选：将当前用户加入 docker 组（无 sudo 用 docker） =========================
+# === 新增：独立版 docker-compose 安装 ==========================================
+if ! command -v docker-compose >/dev/null 2>&1; then
+  echo "📦 安装独立版 docker-compose..."
+  COMPOSE_VERSION="$(curl -fsSL https://api.github.com/repos/docker/compose/releases/latest | grep tag_name | cut -d '"' -f4)"
+  if [[ "$IN_CN" -eq 1 ]]; then
+    DOWNLOAD_URL="https://mirror.ghproxy.com/https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)"
+  else
+    DOWNLOAD_URL="https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)"
+  fi
+  $SUDO curl -L "$DOWNLOAD_URL" -o /usr/local/bin/docker-compose
+  $SUDO chmod +x /usr/local/bin/docker-compose
+  echo "✅ 独立版 docker-compose 已安装完成！版本信息如下："
+  docker-compose --version || echo "⚠️ docker-compose 可能未在 PATH，请检查 /usr/local/bin/"
+else
+  echo "✅ 已检测到 docker-compose，跳过安装。"
+fi
+
+# === 将用户加入 docker 组 ======================================================
 if getent group docker >/dev/null 2>&1; then
   if [[ "${EUID:-$(id -u)}" -ne 0 && -n "${USER:-}" ]]; then
     echo "👤 可选：将用户 ${USER} 加入 docker 组以无 sudo 使用 docker"
@@ -188,7 +192,7 @@ if getent group docker >/dev/null 2>&1; then
   fi
 fi
 
-# === 可选：简单验证（不影响主流程） =============================================
+# === 简单验证 =================================================================
 if command -v docker >/dev/null 2>&1; then
   echo "🧪 进行 hello-world 测试（可跳过失败，不中断）..."
   $SUDO docker run --rm hello-world || true
